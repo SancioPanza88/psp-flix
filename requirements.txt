@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+Pillow
+cryptography
+undetected-chromedriver
+urllib3

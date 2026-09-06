@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
+# Binaries (distributed via GitHub Releases, not tracked in git)
+*.exe
+ffmpeg.exe
+ffprobe.exe
+ffplay.exe
+
+# Generated icons (kept as source PNGs instead)
+*.ico
+
+# PyInstaller spec files (regenerate as needed)
+*.spec
+
+# User runtime config (the app regenerates it)
+psp_config.json
+
+# App runtime output
+downloads/
+_temp_hls_*/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
