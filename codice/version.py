@@ -19,7 +19,7 @@ import json
 import urllib.request
 import urllib.error
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 # <-- IMPOSTA QUI il tuo repository GitHub, formato "utente/nome-repo"
 GITHUB_REPO = "SancioPanza88/psp-flix"

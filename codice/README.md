@@ -118,6 +118,13 @@ as `[PSP-Check]`). If the PSP still refuses a file, check that:
 3. The USB transfer completed fully (compare the file size on the PSP
    with the one on the PC).
 
+> v1.0.3 also fixes two deeper issues: **silent videos** (some providers
+> ship video and audio as separate tracks — the audio is now downloaded
+> and muxed in) and **very slow movie conversion** (ffmpeg stalled on
+> playlists without an end marker). Errors are now specific
+> ("unreachable network", "incomplete download: N segments missing",
+> ...) instead of a generic "FFmpeg error".
+
 ### PSP Thumbnail Maker (cover images)
 
 Since v1.0.2 the main app **already creates** the `.THM` automatically
@@ -245,6 +252,13 @@ verifica che:
    richiede firmware PSP ≥ 3.30).
 3. Il trasferimento USB sia completo (confronta la dimensione del file
    sulla PSP con quella sul PC).
+
+> La v1.0.3 corregge altri due problemi profondi: **video muti** (alcuni
+> provider separano video e audio — ora l'audio viene scaricato e
+> incluso) e **conversioni lentissime dei film** (ffmpeg si piantava
+> sulle playlist senza marcatore di fine). Gli errori ora sono specifici
+> ("rete irraggiungibile", "download incompleto: N segmenti mancanti",
+> ...) invece del generico "FFmpeg error".
 
 ### PSP Thumbnail Maker (copertine)
 

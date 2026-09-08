@@ -1,5 +1,6 @@
 import concurrent.futures
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import threading
 import time
 import unicodedata
 import requests
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 if getattr(sys, 'frozen', False):
     APP_DIR = os.path.dirname(sys.executable)
@@ -212,10 +213,30 @@ PSP_VIDEO_FILTER = (
     "pad=480:272:(ow-iw)/2:(oh-ih)/2"
 )
 
-# Number of HLS segments downloaded in parallel. Over a VPN the request
-# latency (not bandwidth) is the bottleneck, so more concurrent requests keeps
-# the pipe full. The session's connection pool is sized to match this.
-SEGMENT_WORKERS = 16
+# Number of HLS segments downloaded in parallel. Kept deliberately modest:
+# these CDN hosts throttle aggressively when hammered (timeouts, resets,
+# 403s that look like expired tokens). 16 workers triggered rate-limiting
+# on movie-length downloads (~3000 segments for video+audio); 8 is still
+# far faster than the transcode step while staying under the radar.
+# The session's connection pool is sized to match this.
+SEGMENT_WORKERS = 8
+
+# Last human-readable failure reason (for the GUI to display instead of a
+# generic "FFmpeg error"). Reset at the start of every transcode_to_psp call.
+_last_error = ""
+
+
+def get_last_error():
+    """Return the failure reason of the last transcode ("" if none/OK)."""
+    return _last_error
+
+
+def _fail(msg):
+    """Record a failure reason, log it, and return False."""
+    global _last_error
+    _last_error = msg
+    print(f"[Transcoder Error] {msg}")
+    return False
 
 def _build_encode_args():
     """ffmpeg encode arguments for PSP-compatible output.
@@ -432,18 +453,21 @@ def transcode_to_psp(source_url, output_path, headers=None, progress_callback=No
     except Exception as _e:
         print(f"[Transcoder] Could not apply proxy from config: {_e}")
 
+    global _last_error
+    _last_error = ""
+
     try:
         # ------------------------------------------------------------------ #
-        # Step 1 — Resolve master → media playlist                            #
+        # Step 1 — Resolve master → media playlist(s)                         #
         # ------------------------------------------------------------------ #
         if cancel_check and cancel_check():
             return False
 
         # max_attempts=1: fail fast so CDN-edge rotation below triggers
         # immediately rather than hammering the same blocked host 3× first.
-        playlist_url, lines = _resolve_playlist(session, source_url, cancel_check=cancel_check,
-                                                 max_attempts=1)
-        if playlist_url is None:
+        resolved = _resolve_playlist(session, source_url, cancel_check=cancel_check,
+                                     max_attempts=1)
+        if resolved[0] is None:
             # The CDN edge encoded in this particular URL (e.g. a specific
             # "media-NNN" host) may simply be unreachable/down right now —
             # retrying the exact same host endlessly won't help. If we have
@@ -478,51 +502,91 @@ def transcode_to_psp(source_url, output_path, headers=None, progress_callback=No
                         continue
                     print(f"[Transcoder] New source (host={new_host}, token changed={new_token != prev_token}): {new_source_url}")
                     # Full retry resilience now that we have a fresh link.
-                    playlist_url, lines = _resolve_playlist(session, new_source_url,
-                                                            cancel_check=cancel_check, max_attempts=3)
-                    if playlist_url is not None:
+                    resolved = _resolve_playlist(session, new_source_url,
+                                                 cancel_check=cancel_check, max_attempts=3)
+                    if resolved[0] is not None:
                         break
                     prev_host, prev_token = new_host, new_token  # this link is also dead; skip it too
                     time.sleep(2.0)
 
-            if playlist_url is None:
-                print("[Transcoder Error] Could not reach any CDN edge for this stream.")
-                return False
+            if resolved[0] is None:
+                return _fail("Rete irraggiungibile: nessun CDN risponde per questo stream. "
+                             "Se usi un ISP che blocca questi host, serve una VPN/proxy "
+                             "(vedi README, campo \"proxy\" in psp_config.json).")
+
+        playlist_url, video_lines, audio_url, audio_lines = resolved
+        has_audio = audio_url is not None and audio_lines is not None
 
         # ------------------------------------------------------------------ #
-        # Step 2 — Parse playlist: collect segments and encryption keys       #
+        # Step 2 — Parse playlist(s): collect segments and encryption keys    #
         # ------------------------------------------------------------------ #
-        local_lines, segments, keys = _parse_playlist(lines, playlist_url)
+        video_local, video_segs, video_keys = _parse_playlist(
+            video_lines, playlist_url, prefix="v", key_prefix="vk")
+        audio_local, audio_segs, audio_keys = ([], [], [])
+        if has_audio:
+            audio_local, audio_segs, audio_keys = _parse_playlist(
+                audio_lines, audio_url, prefix="a", key_prefix="ak")
+
+        all_segments = video_segs + audio_segs
+        all_keys = video_keys + audio_keys
 
         # ------------------------------------------------------------------ #
         # Step 3 — Download encryption keys                                   #
         # ------------------------------------------------------------------ #
-        if not _download_keys(session, keys, temp_dir, cancel_check):
-            return False
+        if not _download_keys(session, all_keys, temp_dir, cancel_check):
+            return _fail("Chiave di decifratura non scaricabile (CDN/host irraggiungibile).")
 
-        if not segments:
-            print("[Transcoder Error] No segments found in playlist.")
-            return False
+        if not video_segs:
+            return _fail("Playlist senza segmenti video: stream non valido o scaduto.")
 
-        # Write the rewritten local playlist
-        local_playlist_path = os.path.join(temp_dir, "local.m3u8")
-        with open(local_playlist_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(local_lines) + "\n")
+        # Write the rewritten local playlist(s). Always terminate with
+        # #EXT-X-ENDLIST: the origin playlists are VOD but carry no ENDLIST
+        # tag, and without it ffmpeg's HLS demuxer treats the input as a LIVE
+        # event — stalling between segments until the transcode crawls at a
+        # fraction of realtime (this was the "movies slow down" bug: hundreds
+        # of segments x live-poll stall each).
+        video_playlist_path = os.path.join(temp_dir, "video.m3u8")
+        with open(video_playlist_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(_with_endlist(video_local)) + "\n")
+        ffmpeg_inputs = [video_playlist_path]
+        if has_audio and audio_segs:
+            audio_playlist_path = os.path.join(temp_dir, "audio.m3u8")
+            with open(audio_playlist_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(_with_endlist(audio_local)) + "\n")
+            ffmpeg_inputs.append(audio_playlist_path)
+            print(f"[Transcoder] Separate audio track: {len(audio_segs)} segments.")
+        elif has_audio:
+            print("[Transcoder] Audio playlist vuota, procedo solo video.")
+            has_audio = False
 
         # ------------------------------------------------------------------ #
         # Step 4 — Parallel segment download                                  #
         # ------------------------------------------------------------------ #
-        if not _download_segments(session, segments, temp_dir, progress_callback, cancel_check,
+        if not _download_segments(session, all_segments, temp_dir, progress_callback, cancel_check,
                                    refresh_url_callback=refresh_url_callback):
+            # _download_segments already recorded the specific reason.
             return False
 
         if cancel_check and cancel_check():
             return False
 
         # ------------------------------------------------------------------ #
+        # Step 4b — Completeness check before ffmpeg                          #
+        # ------------------------------------------------------------------ #
+        missing = [name for _, name in all_segments
+                   if not os.path.exists(os.path.join(temp_dir, name))
+                   or os.path.getsize(os.path.join(temp_dir, name)) == 0]
+        if missing:
+            return _fail(f"Download incompleto: {len(missing)} segmenti mancanti su "
+                         f"{len(all_segments)} (CDN instabile o throttling). "
+                         f"Riprova più tardi o con VPN/proxy.")
+
+        # ------------------------------------------------------------------ #
         # Step 5 — FFmpeg transcode                                           #
         # ------------------------------------------------------------------ #
-        if not _run_ffmpeg(local_playlist_path, output_path, progress_callback, cancel_check):
+        if not _run_ffmpeg(ffmpeg_inputs, output_path, progress_callback, cancel_check):
+            if not _last_error:
+                return _fail("Conversione FFmpeg fallita (vedi log qui sopra).")
             return False
 
         # ------------------------------------------------------------------ #
@@ -584,8 +648,61 @@ def _get_with_retry(session, url, timeout=15, max_attempts=5, cancel_check=None,
     return None
 
 
+def _pick_audio_uri(master_lines, master_url):
+    """Return the URI of the preferred AUDIO rendition, or None.
+
+    Prefers the DEFAULT=YES rendition (vixcloud marks the Italian track
+    default when language=it was requested), else the first audio group.
+    Subtitle groups are ignored (the PSP can't use them anyway).
+    """
+    fallback = None
+    for line in master_lines:
+        if not (line.startswith("#EXT-X-MEDIA") and "TYPE=AUDIO" in line):
+            continue
+        m = re.search(r'URI="([^"]+)"', line)
+        if not m:
+            continue
+        uri = urljoin(master_url, m.group(1))
+        if fallback is None:
+            fallback = uri
+        if "DEFAULT=YES" in line:
+            return uri
+    return fallback
+
+
+def _pick_variant_url(master_lines, master_url):
+    """Return the URL of the cheapest video variant.
+
+    Master playlists list e.g. 480p + 720p renditions: for a 480x272 PSP
+    target the lowest BANDWIDTH is always the right choice (fewer bytes to
+    download, faster to transcode, same final quality). Falls back to the
+    first variant when no BANDWIDTH is advertised.
+    """
+    variants = []  # (bandwidth_or_None, url)
+    for i, line in enumerate(master_lines):
+        if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(master_lines):
+            m = re.search(r"BANDWIDTH=(\d+)", line)
+            bw = int(m.group(1)) if m else None
+            variants.append((bw, urljoin(master_url, master_lines[i + 1])))
+    if not variants:
+        return None
+    with_bw = [(bw, url) for bw, url in variants if bw is not None]
+    if with_bw:
+        best = min(with_bw, key=lambda t: t[0])
+        print(f"[Transcoder] Variants: {len(variants)}, picking lowest bandwidth ({best[0] // 1000}k).")
+        return best[1]
+    return variants[0][1]
+
+
 def _resolve_playlist(session, source_url, cancel_check=None, max_attempts=3, timeout=10):
-    """Return (playlist_url, stripped_lines).  Follows master → media.
+    """Return (video_url, video_lines, audio_url, audio_lines).
+
+    Follows master → media playlists. Handles two master shapes:
+      * classic: variants are muxed (video+audio) → audio_* are None;
+      * vixcloud-style: video-only variants + separate EXT-X-MEDIA AUDIO
+        rendition(s) → both are fetched so the final MP4 has sound.
+
+    On failure returns (None, None, None, None).
 
     max_attempts=1 is intentional when called for the initial fetch: we want
     to fail fast so the outer CDN-edge-rotation loop in transcode_to_psp can
@@ -597,30 +714,46 @@ def _resolve_playlist(session, source_url, cancel_check=None, max_attempts=3, ti
         r = _get_with_retry(session, source_url, timeout=timeout, max_attempts=max_attempts,
                              cancel_check=cancel_check, label="Playlist")
         if r is None:
-            return None, None
+            return None, None, None, None
 
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
 
-        # Check for a master playlist (contains STREAM-INF)
-        for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
-                variant_url = urljoin(source_url, lines[i + 1])
-                print(f"[Transcoder] Variant playlist: {variant_url}")
-                r2 = _get_with_retry(session, variant_url, timeout=timeout, max_attempts=max_attempts,
-                                      cancel_check=cancel_check, label="Variant playlist")
-                if r2 is None:
-                    return None, None
-                return variant_url, [l.strip() for l in r2.text.splitlines() if l.strip()]
+        # Media playlist straight away (no STREAM-INF)?
+        variant_url = _pick_variant_url(lines, source_url)
+        if variant_url is None:
+            return source_url, lines, None, None
 
-        return source_url, lines
+        audio_url = _pick_audio_uri(lines, source_url)
+        print(f"[Transcoder] Variant playlist: {variant_url}")
+        r2 = _get_with_retry(session, variant_url, timeout=timeout, max_attempts=max_attempts,
+                              cancel_check=cancel_check, label="Variant playlist")
+        if r2 is None:
+            return None, None, None, None
+        video_lines = [l.strip() for l in r2.text.splitlines() if l.strip()]
+
+        audio_lines = None
+        if audio_url:
+            print(f"[Transcoder] Audio playlist: {audio_url}")
+            r3 = _get_with_retry(session, audio_url, timeout=timeout, max_attempts=max_attempts,
+                                  cancel_check=cancel_check, label="Audio playlist")
+            if r3 is None:
+                print("[Transcoder] Audio playlist unreachable, continuing video-only.")
+                audio_url = None
+            else:
+                audio_lines = [l.strip() for l in r3.text.splitlines() if l.strip()]
+
+        return variant_url, video_lines, audio_url, audio_lines
     except Exception as e:
         print(f"[Transcoder Error] _resolve_playlist: {e}")
-        return None, None
+        return None, None, None, None
 
 
-def _parse_playlist(lines, playlist_url):
+def _parse_playlist(lines, playlist_url, prefix="seg", key_prefix="key"):
     """
     Walk through playlist lines, collecting segments and keys.
+
+    `prefix`/`key_prefix` namespace the local filenames so video and audio
+    tracks can share one temp dir (v_000000.ts vs a_000000.ts).
 
     Returns:
         local_lines: Lines for the rewritten local playlist.
@@ -636,14 +769,14 @@ def _parse_playlist(lines, playlist_url):
         if not line.startswith("#"):
             # Segment
             seg_url = urljoin(playlist_url, line)
-            local_name = f"seg_{len(segments):06d}.ts"
+            local_name = f"{prefix}_{len(segments):06d}.ts"
             segments.append((seg_url, local_name))
             local_lines.append(local_name)
         elif line.startswith("#EXT-X-KEY"):
             m = re.search(r'URI=["\']?([^"\'>,]+)["\']?', line)
             if m:
                 key_url = urljoin(playlist_url, m.group(1))
-                local_name = f"key_{key_counter}.key"
+                local_name = f"{key_prefix}_{key_counter}.key"
                 keys.append((key_url, local_name))
                 key_counter += 1
                 new_line = line.replace(m.group(0), f'URI="{local_name}"')
@@ -654,6 +787,23 @@ def _parse_playlist(lines, playlist_url):
             local_lines.append(line)
 
     return local_lines, segments, keys
+
+
+def _seg_identity(url):
+    """Stable segment identity across token refreshes: path basename only
+    (query tokens change, the CDN path doesn't)."""
+    try:
+        path = urlsplit(url).path
+    except Exception:
+        path = url.split("?", 1)[0]
+    return path.rsplit("/", 1)[-1] or url
+
+
+def _with_endlist(local_lines):
+    """Append #EXT-X-ENDLIST unless already present (see caller comment)."""
+    if any(l.strip() == "#EXT-X-ENDLIST" for l in local_lines):
+        return local_lines
+    return local_lines + ["#EXT-X-ENDLIST"]
 
 
 def _download_keys(session, keys, temp_dir, cancel_check):
@@ -685,21 +835,21 @@ def _download_keys(session, keys, temp_dir, cancel_check):
 def _download_segments(session, segments, temp_dir, progress_callback, cancel_check, refresh_url_callback=None):
     """Download all HLS segments in parallel.  Returns False on failure.
 
-    Mirrors the timeout/retry resilience used by StreamFlix's NetworkClient
-    (30s timeouts, no fail-fast on a single transient error) plus a serial
-    retry pass for any segment that still fails after the parallel attempt,
-    instead of aborting the whole job over one bad segment.
-
-    Additionally handles HTTP 403 responses, which on these providers mean
-    the token embedded in the playlist/segment URLs has expired mid-download
-    (common on long, movie-length videos) rather than a transient network
-    error. In that case retrying the same URL is pointless — instead, when
-    a 403 cluster is detected, the stream is re-resolved from the original
-    page via `refresh_url_callback` (fresh token) and the new segment URLs
-    are substituted in for everything that hasn't downloaded yet.
+    Resilience notes (learned the hard way on these CDNs):
+      * Only 8 parallel workers + staggered start: hammering with 16
+        triggered server-side throttling (timeouts/resets/403s) halfway
+        through movie-length downloads (~3000 segments with audio).
+      * HTTP 403 usually means the token embedded in the segment URLs
+        expired mid-download → re-resolve from the original page and swap
+        in fresh URLs, matched by path identity (robust to reordering and
+        count changes), not by position.
+      * Timeouts Resets get long jittered backoff instead of fail-fast:
+        the CDN tarpits under load and recovers a few seconds later.
+      * A serial retry pass mops up whatever the parallel pass missed
+        instead of aborting the whole job over a few bad segments.
     """
     total = len(segments)
-    print(f"[Transcoder] Downloading {total} segments...")
+    print(f"[Transcoder] Downloading {total} segments ({SEGMENT_WORKERS} workers)...")
 
     lock = threading.Lock()
     downloaded = [0]
@@ -712,9 +862,11 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
     refresh_state = {"version": 0}
 
     def do_refresh(my_version):
-        """Re-resolve the stream and remap remaining segment URLs by position.
+        """Re-resolve the stream and remap remaining segment URLs.
         Only one thread actually performs the refresh per token-expiry event;
-        the rest detect the version bump and just retry with the new URLs."""
+        the rest detect the version bump and just retry with the new URLs.
+        Matching is by path identity (CDN path is stable, query tokens are
+        not), so reordered or resized playlists still map correctly."""
         if not refresh_url_callback:
             return False
         with refresh_lock:
@@ -731,28 +883,42 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
                 print("[Transcoder] Refresh callback returned no URL.")
                 return False
 
-            new_playlist_url, new_lines = _resolve_playlist(session, new_source_url, cancel_check=cancel_check)
-            if new_playlist_url is None:
+            new_resolved = _resolve_playlist(session, new_source_url, cancel_check=cancel_check)
+            if new_resolved[0] is None:
                 print("[Transcoder] Could not re-fetch playlist after refresh.")
                 return False
-            _, new_segments, _ = _parse_playlist(new_lines, new_playlist_url)
+            new_playlist_url, new_video_lines = new_resolved[0], new_resolved[1]
+            new_audio_url, new_audio_lines = new_resolved[2], new_resolved[3]
+            _, new_video_segs, _ = _parse_playlist(new_video_lines, new_playlist_url,
+                                                   prefix="v", key_prefix="vk")
+            new_all = list(new_video_segs)
+            if new_audio_url and new_audio_lines:
+                _, new_audio_segs, _ = _parse_playlist(new_audio_lines, new_audio_url,
+                                                       prefix="a", key_prefix="ak")
+                new_all.extend(new_audio_segs)
 
-            if len(new_segments) != total:
-                print(f"[Transcoder] Refreshed playlist segment count mismatch "
-                      f"({len(new_segments)} vs {total}); refresh aborted.")
-                return False
+            by_identity = {}
+            for new_url, _new_name in new_all:
+                by_identity.setdefault(_seg_identity(new_url), new_url)
 
-            # Segments are generated in the same order every time (seg_000000.ts, ...),
-            # so position == identity. Swap in the fresh, still-valid URLs.
+            remapped = 0
             with lock:
-                for new_url, local_name in new_segments:
-                    current_url[local_name] = new_url
+                for local_name, old_url in current_url.items():
+                    fresh = by_identity.get(_seg_identity(old_url))
+                    if fresh is not None and fresh != old_url:
+                        current_url[local_name] = fresh
+                        remapped += 1
                 refresh_state["version"] += 1
-            print("[Transcoder] Stream URL refreshed successfully, resuming download.")
+            if remapped:
+                print(f"[Transcoder] Stream URL refreshed, {remapped} segment URL(s) updated.")
+            else:
+                print("[Transcoder] Refresh returned identical URLs; retrying anyway.")
+            # Small pause so all workers don't hammer the fresh URLs at once.
+            time.sleep(0.5)
             return True
 
-    def fetch_segment(local_name, seg_path, max_attempts=5):
-        """Try to download a single segment with exponential backoff.
+    def fetch_segment(local_name, seg_path, max_attempts=6):
+        """Try to download a single segment with jittered exponential backoff.
         Refreshes the token once if the server starts returning 403s."""
         attempted_refresh = False
         for attempt in range(max_attempts):
@@ -761,7 +927,7 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
                 return False
             url = current_url[local_name]
             try:
-                r = session.get(url, timeout=(8, 25))
+                r = session.get(url, timeout=(8, 40))
                 if r.status_code == 200 and r.content:
                     with open(seg_path, "wb") as f:
                         f.write(r.content)
@@ -772,13 +938,15 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
                         attempted_refresh = True
                         do_refresh(refresh_state["version"])  # may update current_url[local_name]
                         continue  # retry immediately with the (possibly) refreshed url
+                elif r.status_code in (500, 502, 503, 504):
+                    print(f"[Transcoder] Segment HTTP {r.status_code} (server busy), backing off ({attempt + 1}/{max_attempts})...")
                 else:
                     print(f"[Transcoder] Segment HTTP {r.status_code}, retrying ({attempt + 1}/{max_attempts})...")
             except Exception as e:
                 print(f"[Transcoder] Segment attempt {attempt + 1}/{max_attempts} failed: {e}")
 
             if attempt < max_attempts - 1:
-                time.sleep(min(0.5 * (2 ** attempt), 3.0))
+                time.sleep(min(1.0 * (2 ** attempt), 10.0) + random.uniform(0, 0.5))
         return False
 
     def download_one(local_name):
@@ -786,12 +954,20 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
             cancelled[0] = True
             return None
 
+        # Stagger worker start to avoid a thundering-herd burst that the
+        # CDN's rate limiter reads as an attack.
+        time.sleep(random.uniform(0, 0.4))
         seg_path = os.path.join(temp_dir, local_name)
+        if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+            with lock:
+                downloaded[0] += 1
+                progress_callback((downloaded[0] / total) * 80.0)
+            return True
         ok = fetch_segment(local_name, seg_path)
         if ok:
             with lock:
                 downloaded[0] += 1
-                progress_callback((downloaded[0] / total) * 85.0)
+                progress_callback((downloaded[0] / total) * 80.0)
             return True
         return False
 
@@ -809,7 +985,7 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
                 failed_segments.append(futures[future])
 
     # Serial retry pass for whatever didn't make it through the parallel
-    # pass, instead of aborting the entire download over one bad segment.
+    # pass, instead of aborting the entire download over a few bad segments.
     if failed_segments:
         print(f"[Transcoder] Retrying {len(failed_segments)} segment(s) that failed initially...")
         still_failed = []
@@ -818,30 +994,46 @@ def _download_segments(session, segments, temp_dir, progress_callback, cancel_ch
                 print("\n[Transcoder] Cancelled.")
                 return False
             seg_path = os.path.join(temp_dir, local_name)
-            if fetch_segment(local_name, seg_path, max_attempts=5):
+            if fetch_segment(local_name, seg_path, max_attempts=6):
                 with lock:
                     downloaded[0] += 1
-                    progress_callback((downloaded[0] / total) * 85.0)
+                    progress_callback((downloaded[0] / total) * 80.0)
             else:
                 still_failed.append(local_name)
 
         if still_failed:
-            print(f"\n[Transcoder Error] {len(still_failed)} segment(s) could not be downloaded after retries.")
-            return False
+            return _fail(f"{len(still_failed)} segmenti non scaricabili dopo tutti i retry "
+                         f"(CDN instabile/throttling). Riprova più tardi o con VPN/proxy.")
 
-    progress_callback(90.0)
+    progress_callback(80.0)
     return True
 
 
-def _run_ffmpeg(local_playlist_path, output_path, progress_callback, cancel_check):
-    """Run ffmpeg on the local playlist and stream progress updates."""
-    print("[Transcoder] Starting FFmpeg conversion...")
+def _run_ffmpeg(input_playlists, output_path, progress_callback, cancel_check):
+    """Run ffmpeg on the local playlist(s) and stream progress updates.
 
-    cmd = [
-        _get_ffmpeg(), "-y", "-nostdin",
-        "-protocol_whitelist", "file,crypto",
-        "-allowed_extensions", "ALL",
-        "-i", local_playlist_path,
+    `input_playlists` is a list: [video.m3u8] for classic muxed streams,
+    [video.m3u8, audio.m3u8] when the master carried a separate AUDIO
+    rendition (vixcloud-style) — mapped explicitly and cut to the shortest
+    track so A/V never drift apart.
+    """
+    if isinstance(input_playlists, str):
+        input_playlists = [input_playlists]
+    print(f"[Transcoder] Starting FFmpeg conversion ({len(input_playlists)} input(s))...")
+
+    cmd = [_get_ffmpeg(), "-y", "-nostdin"]
+    for pl in input_playlists:
+        # NB: queste sono opzioni DI INPUT (demuxer/HLS): valgono solo per
+        # l'-i che segue, quindi vanno ripetute davanti a OGNI input.
+        # Senza allowed_extensions sul secondo input, ffmpeg rifiuta il file
+        # .key ("blocked for security reasons") e l'audio fallisce.
+        cmd += ["-fflags", "+discardcorrupt",
+                "-protocol_whitelist", "file,crypto",
+                "-allowed_extensions", "ALL",
+                "-i", pl]
+    if len(input_playlists) > 1:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+    cmd += [
         *_build_encode_args(),
         output_path,
     ]
@@ -881,8 +1073,8 @@ def _run_ffmpeg(local_playlist_path, output_path, progress_callback, cancel_chec
 
         m = re.search(r"time=\s*(\d{2}:\d{2}:\d{2}\.\d{2})", line)
         if m and duration_seconds > 0:
-            pct = min(10.0, (parse_time(m.group(1)) / duration_seconds) * 10.0)
-            progress_callback(90.0 + pct)
+            pct = min(20.0, (parse_time(m.group(1)) / duration_seconds) * 20.0)
+            progress_callback(80.0 + pct)
 
     process.wait()
 
@@ -895,7 +1087,9 @@ def _run_ffmpeg(local_playlist_path, output_path, progress_callback, cancel_chec
     print("--- FFmpeg output (last 50 lines) ---")
     print("".join(ffmpeg_log[-50:]))
     print("-------------------------------------")
-    return False
+    tail = "".join(ffmpeg_log[-8:])
+    return _fail(f"Conversione FFmpeg fallita (codice {process.returncode}). "
+                 f"Dettagli nel log. Ultime righe: {tail.strip()[:300]}")
 
 
 # ---------------------------------------------------------------------------

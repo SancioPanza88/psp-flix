@@ -46,7 +46,7 @@ from pspflix.extractors import extract
 from pspflix.models import Movie, TvShow, Episode
 
 from scrapers import SESSION, get_headers, safe_get
-from transcoder import transcode_to_psp, sanitize_psp_basename
+from transcoder import transcode_to_psp, sanitize_psp_basename, get_last_error
 from config import load_config, save_config
 from version import APP_VERSION, check_for_update
 
@@ -770,7 +770,8 @@ class StreamflixGUI(tk.Tk):
             elif success:
                 self.after(0, lambda: self._update_item(item, "Complete - copia .mp4 + .THM in PSP:/VIDEO/", 100.0))
             else:
-                self.after(0, lambda: self._update_item(item, "FFmpeg error", 0.0))
+                reason = (get_last_error() or "Errore sconosciuto")[:90]
+                self.after(0, lambda r=reason: self._update_item(item, f"Error: {r}", 0.0))
         except Exception as e:
             if item["status"] == "Cancelled":
                 if output_path and os.path.exists(output_path):
@@ -782,7 +783,7 @@ class StreamflixGUI(tk.Tk):
 
     def _on_progress(self, item, pct):
         if item["status"] != "Cancelled":
-            label = "Segments" if pct < 90.0 else "Converting"
+            label = "Segments" if pct < 80.0 else "Converting"
             self.after(0, lambda p=pct, lbl=label: self._update_item(item, f"{lbl} {p:.1f}%", p))
 
     @staticmethod
